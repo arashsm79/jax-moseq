@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import gc
 
 from dynamax.hidden_markov_model.inference import hmm_smoother
 
@@ -23,21 +22,6 @@ from jax_moseq.utils.transitions import resample_hdp_transitions
 from functools import partial
 
 na = jnp.newaxis
-
-
-# Module-level helper functions to avoid closure captures in mixed_map
-def _resample_discrete_single(seed_n, x_n, mask_n, Ab, Q, pi):
-    """Helper for resample_discrete_stateseqs - pure function with explicit args."""
-    lls = jax.vmap(lambda Ab_k, Q_k: ar_log_likelihood(x_n, (Ab_k, Q_k)))(Ab, Q)
-    _, z_n = sample_hmm_stateseq(seed_n, pi, lls.T, mask_n)
-    return z_n
-
-
-def _stateseq_marginals_single(x_n, mask_n, Ab, Q, pi, initial_distribution):
-    """Helper for stateseq_marginals - pure function with explicit args."""
-    lls = jax.vmap(lambda Ab_k, Q_k: ar_log_likelihood(x_n, (Ab_k, Q_k)))(Ab, Q)
-    masked_lls = lls.T * mask_n[:, na]
-    return hmm_smoother(initial_distribution, pi, masked_lls).smoothed_probs
 
 
 @jax.jit
@@ -68,10 +52,11 @@ def resample_discrete_stateseqs(seed, x, mask, Ab, Q, pi, **kwargs):
         Discrete state sequences.
     """
     nlags = get_nlags(Ab)
-
-    z = mixed_map(partial(_resample_discrete_single, Ab=Ab, Q=Q, pi=pi))(
+    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
+    _, z = jax.vmap(sample_hmm_stateseq, in_axes=(0, na, 0, 0))(
         jr.split(seed, mask.shape[0]),
-        x,
+        pi,
+        jnp.moveaxis(log_likelihoods, 0, -1),
         mask.astype(float)[:, nlags:],
     )
     return z
@@ -106,10 +91,12 @@ def stateseq_marginals(x, mask, Ab, Q, pi, **kwargs):
     num_states = pi.shape[0]
 
     initial_distribution = jnp.ones(num_states) / num_states
+    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
+    log_likelihoods = jnp.moveaxis(log_likelihoods, 0, -1)
+    masked_log_likelihoods = log_likelihoods * mask[:, nlags:, na]
 
-    z_marginals = mixed_map(
-        partial(_stateseq_marginals_single, Ab=Ab, Q=Q, pi=pi, initial_distribution=initial_distribution)
-    )(x, mask[:, nlags:])
+    smoother = lambda lls: hmm_smoother(initial_distribution, pi, lls).smoothed_probs
+    z_marginals = mixed_map(smoother)(masked_log_likelihoods)
     return z_marginals
 
 
@@ -155,19 +142,12 @@ def resample_ar_params(
     """
     seeds = jr.split(seed, num_states)
 
-    mask_flat = mask[..., nlags:].reshape(-1)
-    z_flat = z.reshape(-1)
+    masks = mask[..., nlags:].reshape(1, -1) * jnp.eye(num_states)[:, z.reshape(-1)]
     x_in = pad_affine(get_lags(x, nlags)).reshape(-1, nlags * x.shape[-1] + 1)
     x_out = x[..., nlags:, :].reshape(-1, x.shape[-1])
 
-    def _resample_single(args):
-        seed_k, state_idx = args
-        mask_k = mask_flat * (z_flat == state_idx).astype(float)
-        return _resample_regression_params(
-            x_in, x_out, nu_0, S_0, M_0, K_0, (seed_k, mask_k)
-        )
-
-    Ab, Q = jax.lax.map(_resample_single, (seeds, jnp.arange(num_states)))
+    map_fun = partial(_resample_regression_params, x_in, x_out, nu_0, S_0, M_0, K_0)
+    Ab, Q = jax.lax.map(map_fun, (seeds, masks))
     return Ab, Q
 
 
@@ -256,31 +236,19 @@ def resample_model(
     if not states_only:
         if verbose:
             print("Resampling pi (transition matrix)")
-        params.pop("pi", None)
         params["betas"], params["pi"] = resample_hdp_transitions(
             seed, **data, **states, **params, **hypparams["trans_hypparams"]
         )
-        params["pi"].block_until_ready()
-        params["betas"].block_until_ready()
 
         if verbose:
             print("Resampling Ab,Q (AR parameters)")
-        params.pop("Ab", None)
-        params.pop("Q", None)
         params["Ab"], params["Q"] = resample_ar_params(
             seed, **data, **states, **params, **hypparams["ar_hypparams"]
         )
-        params["Ab"].block_until_ready()
-        params["Q"].block_until_ready()
 
     if verbose:
         print("Resampling z (discrete latent states)")
-    states.pop("z", None)
     states["z"] = resample_discrete_stateseqs(seed, **data, **states, **params)
-    states["z"].block_until_ready()
-
-    # Force garbage collection to free memory
-    gc.collect()
 
     return {
         "seed": seed,

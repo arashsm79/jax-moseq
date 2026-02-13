@@ -166,6 +166,7 @@ def resample_heading_and_centroid(
     sigmasq_h,
     delta_v,
     sigmasq_v,
+    batch_size=50,
     sigmasq_height=1,
     **kwargs
 ):
@@ -198,6 +199,9 @@ def resample_heading_and_centroid(
         Mean change in centroid for each discrete state.
     sigmasq_v : jax array of shape (num_states,)
         Variance of centroid change for each discrete state.
+    batch_size : int, default=50
+        Number of recordings to process at once for batched
+        sub-steps when needed.
     sigmasq_height : float, default=1
         Variance of height change on each step.
     **kwargs : dict
@@ -236,7 +240,7 @@ def resample_heading_and_centroid(
     if Y.shape[-1] == 3:
         seed = jr.split(seed)[0]
         v_height = keypoint_slds.resample_location(
-            seed, Y, mask, x, h, s, Cd, sigmasq, sigmasq_height
+            seed, Y, mask, x, h, s, Cd, sigmasq, sigmasq_height, batch_size=batch_size
         )[..., 2:]
         v = jnp.concatenate([v, v_height], axis=-1)
 
@@ -255,6 +259,7 @@ def resample_model(
     skip_noise=False,
     ignore_allo_dynamics_for_location_sampling=False,
     verbose=False,
+    batch_size=50,
     jitter=0,
     parallel_message_passing=False,
     **kwargs
@@ -285,6 +290,9 @@ def resample_model(
     ignore_allo_dynamics_for_location_sampling : default=False
         Whether to ignore allocentric dynamics when resampling centroid
         and heading using
+    batch_size : int, default=50
+        Number of recordings per batch used by all batched
+        resampling steps.
     jitter : float, default=1e-3
         Amount to boost the diagonal of the covariance matrix
         during backward-sampling of the continuous states.
@@ -352,6 +360,7 @@ def resample_model(
             **data,
             **states,
             **params,
+            batch_size=batch_size,
             jitter=jitter,
             parallel_message_passing=parallel_message_passing
         )
@@ -360,14 +369,24 @@ def resample_model(
             print("Resampling centroid and heading")
         if ignore_allo_dynamics_for_location_sampling:
             states["h"] = keypoint_slds.resample_heading(
-                seed, **data, **states, **params
+                seed, **data, **states, **params, batch_size=batch_size
             )
             states["v"] = keypoint_slds.resample_location(
-                seed, **data, **states, **params, **hypparams["cen_hypparams"]
+                seed,
+                **data,
+                **states,
+                **params,
+                **hypparams["cen_hypparams"],
+                batch_size=batch_size,
             )
         else:
             states["h"], states["v"] = resample_heading_and_centroid(
-                seed, **data, **states, **params, **hypparams["allo_hypparams"]
+                seed,
+                **data,
+                **states,
+                **params,
+                **hypparams["allo_hypparams"],
+                batch_size=batch_size,
             )
 
         if not skip_noise:
@@ -378,6 +397,7 @@ def resample_model(
                 **data,
                 **states,
                 **params,
+                batch_size=batch_size,
                 s_0=noise_prior,
                 **hypparams["obs_hypparams"]
             )

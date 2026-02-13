@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import gc
 from functools import partial
 
 from jax_moseq.utils.kalman import kalman_sample
@@ -19,68 +18,7 @@ from jax_moseq.models.keypoint_slds.alignment import (
 na = jnp.newaxis
 
 
-# Memory monitoring helper
-def print_memory_usage(label=""):
-    """Print current device memory usage."""
-    try:
-        for device in jax.devices():
-            stats = device.memory_stats()
-            used_gb = stats['bytes_in_use'] / 1e9
-            limit_gb = stats.get('bytes_limit', 0) / 1e9 if stats.get('bytes_limit') else 0
-            if limit_gb > 0:
-                print(f"  [{label}] Device {device.id}: {used_gb:.2f}GB / {limit_gb:.2f}GB ({used_gb/limit_gb*100:.1f}%)")
-            else:
-                print(f"  [{label}] Device {device.id}: {used_gb:.2f}GB")
-    except Exception as e:
-        print(f"  [{label}] Memory stats unavailable: {e}")
-
-
-# Module-level JIT-compiled functions to avoid recompilation in loops
-@jax.jit
-def _resample_single_sequence_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0):
-    """Helper function for resampling scales - pure function with no closures."""
-    sqerr = compute_squared_error(Y, x, v, h, Cd)
-    result = slds.resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
-    return result
-
-
-_resample_scales_batch_kernel = jax.jit(jax.vmap(
-    _resample_single_sequence_scales, in_axes=(0, 0, 0, 0, 0, None, None, None, 0)
-))
-
-
-@jax.jit
-def _compute_heading_mean_direction_single(Y, x, v, s, Cd, sigmasq):
-    """Compute mean direction for heading (deterministic part) for a single recording."""
-    k = Y.shape[-2]
-    
-    Y_bar = estimate_aligned(x, Cd, k)
-    Y_cent = Y - v[..., na, :]
-    variance = s * sigmasq
-    
-    # Only use first 2 dimensions for rotation estimation
-    Y_bar_2d = Y_bar[..., :2]
-    Y_cent_2d = Y_cent[..., :2]
-    
-    # Compute weighted S matrix components
-    S_00 = ((Y_bar_2d[..., 0] * Y_cent_2d[..., 0]) / variance).sum(-1)
-    S_01 = ((Y_bar_2d[..., 0] * Y_cent_2d[..., 1]) / variance).sum(-1)
-    S_10 = ((Y_bar_2d[..., 1] * Y_cent_2d[..., 0]) / variance).sum(-1)
-    S_11 = ((Y_bar_2d[..., 1] * Y_cent_2d[..., 1]) / variance).sum(-1)
-    
-    kappa_cos = S_00 + S_11
-    kappa_sin = S_01 - S_10
-    mean_direction = jnp.stack([kappa_cos, kappa_sin], axis=-1)
-    return mean_direction
-
-
-# Global JIT-compiled vmap for heading mean direction computation
-_compute_heading_batch_kernel = jax.jit(jax.vmap(
-    _compute_heading_mean_direction_single, in_axes=(0, 0, 0, 0, None, None)
-))
-
-
-# @partial(jax.jit, static_argnames=("parallel_message_passing",))
+@partial(jax.jit, static_argnames=("parallel_message_passing",))
 def resample_continuous_stateseqs(
     seed,
     Y,
@@ -93,9 +31,8 @@ def resample_continuous_stateseqs(
     sigmasq,
     Ab,
     Q,
-    batch_size=50,
     jitter=1e-3,
-    parallel_message_passing=False,
+    parallel_message_passing=True,
     **kwargs
 ):
     """
@@ -125,10 +62,6 @@ def resample_continuous_stateseqs(
         Autoregressive transforms.
     Q : jax array of shape (num_states, latent_dim, latent_dim)
         Autoregressive noise covariances.
-    batch_size : int, default=50
-        Number of recordings to process at once when transforming
-        keypoints and sampling continuous states. Reduce this value
-        to lower peak memory use.
     jitter : float, default=1e-3
         Amount to boost the diagonal of the covariance matrix
         during backward-sampling of the continuous states.
@@ -143,39 +76,20 @@ def resample_continuous_stateseqs(
     x : jax array of shape (N, T, latent_dim)
         Latent trajectories.
     """
-    N = Y.shape[0]
-    seeds = jr.split(seed, N)
-    results = []
-
-    for i in range(0, N, batch_size):
-        end = min(i + batch_size, N)
-
-        Y_transformed, s_transformed, Cd_transformed, sigmasq_transformed = to_vanilla_slds(
-            Y[i:end], v[i:end], h[i:end], s[i:end], Cd, sigmasq
-        )
-
-        x_batch = slds.resample_continuous_stateseqs(
-            seed,
-            Y_transformed,
-            mask[i:end],
-            z[i:end],
-            s_transformed,
-            Ab,
-            Q,
-            Cd_transformed,
-            sigmasq_transformed,
-            batch_size=batch_size,
-            seeds=seeds[i:end],
-            jitter=jitter,
-            parallel_message_passing=parallel_message_passing,
-        )
-        x_batch.block_until_ready()
-        results.append(x_batch)
-
-        del Y_transformed, s_transformed, Cd_transformed, sigmasq_transformed, x_batch
-
-    x = jnp.concatenate(results, axis=0)
-    del results
+    Y, s, Cd, sigmasq = to_vanilla_slds(Y, v, h, s, Cd, sigmasq)
+    x = slds.resample_continuous_stateseqs(
+        seed,
+        Y,
+        mask,
+        z,
+        s,
+        Ab,
+        Q,
+        Cd,
+        sigmasq,
+        jitter=jitter,
+        parallel_message_passing=parallel_message_passing,
+    )
     return x
 
 
@@ -215,15 +129,13 @@ def resample_obs_variance(seed, Y, mask, Cd, x, v, h, s, nu_sigma, sigmasq_0, **
         Unscaled noise.
     """
     sqerr = compute_squared_error(Y, x, v, h, Cd, mask)
-    result = slds.resample_obs_variance_from_sqerr(
+    return slds.resample_obs_variance_from_sqerr(
         seed, sqerr, mask, s, nu_sigma, sigmasq_0
     )
-    del sqerr
-    return result
 
 
-
-def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, batch_size=50, **kwargs):
+@jax.jit
+def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, **kwargs):
     """
     Resample the scale values ``s``.
 
@@ -247,9 +159,6 @@ def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, batch_size=50, **k
         Chi-squared degrees of freedom in noise prior.
     s_0 : scalar or jax array broadcastable to ``Y``
         Prior on noise scale.
-    batch_size : int, default=50
-        Number of recordings to process at once when resampling
-        local noise scales.
     **kwargs : dict
         Overflow, for convenience.
 
@@ -258,42 +167,8 @@ def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, batch_size=50, **k
     s : jax array of shape (N, T, k)
         Noise scales.
     """
-    N = Y.shape[0]
-    seeds = jr.split(seed, N)
-    is_s0_per_seq = hasattr(s_0, "shape") and s_0.shape[0] == N
-    
-    results = []
-    for i in range(0, N, batch_size):
-        end = min(i + batch_size, N)
-        batch = [arr[i:end] for arr in (seeds, Y, x, v, h)]
-        
-        if is_s0_per_seq:
-            batch_s_0 = s_0[i:end]
-        elif hasattr(s_0, "shape"):
-            batch_s_0 = jnp.repeat(s_0[na, ...], end - i, axis=0)
-        else:
-            batch_s_0 = jnp.full((end - i,), s_0)
-        
-        if end - i < batch_size:
-            def pad(a):
-                return jnp.pad(
-                    a,
-                    [(0, batch_size - a.shape[0])] + [(0, 0)] * (a.ndim - 1),
-                    mode="edge",
-                )
-            batch = [pad(a) for a in batch]
-            batch_s_0 = pad(batch_s_0)
-        
-        result = _resample_scales_batch_kernel(*batch, Cd, sigmasq, nu_s, batch_s_0)
-        result.block_until_ready()
-        results.append(result[:end - i])
-        
-        # Clean up batch intermediates
-        del batch, batch_s_0, result
-    
-    final_result = jnp.concatenate(results, axis=0)
-    del results
-    return final_result
+    sqerr = compute_squared_error(Y, x, v, h, Cd)
+    return slds.resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
 
 
 @jax.jit
@@ -325,12 +200,13 @@ def compute_squared_error(Y, x, v, h, Cd, mask=None):
     """
     Y_est = estimate_coordinates(x, v, h, Cd)
     sqerr = ((Y - Y_est) ** 2).sum(-1)
-    del Y_est
     if mask is not None:
         sqerr = mask[..., na] * sqerr
     return sqerr
 
-def resample_heading(seed, Y, x, v, s, Cd, sigmasq, batch_size=50, **kwargs):
+
+@jax.jit
+def resample_heading(seed, Y, x, v, s, Cd, sigmasq, **kwargs):
     """
     Resample the heading angles ``h``.
 
@@ -350,48 +226,35 @@ def resample_heading(seed, Y, x, v, s, Cd, sigmasq, batch_size=50, **kwargs):
         Observation transform.
     sigmasq : jax_array of shape k
         Unscaled noise.
-    batch_size : int, default=50
-        Number of recordings to process at once when computing
-        heading mean directions.
     **kwargs : dict
         Overflow, for convenience.
 
     Returns
-    -------
+    ------
     h : jax array of shape (N, T)
         Heading angles.
     """
-    # Compute mean directions in batches (deterministic, no randomness)
-    N = Y.shape[0]
-    
-    mean_directions = []
-    for i in range(0, N, batch_size):
-        end = min(i + batch_size, N)
-        
-        # Use global vmap kernel for batch processing
-        batch_mean_dir = _compute_heading_batch_kernel(
-            Y[i:end],
-            x[i:end],
-            v[i:end],
-            s[i:end],
-            Cd,
-            sigmasq
-        )
-        batch_mean_dir.block_until_ready()
-        mean_directions.append(batch_mean_dir)
-        del batch_mean_dir
-    
-    # Concatenate all mean directions
-    mean_direction = jnp.concatenate(mean_directions, axis=0)
-    del mean_directions
-    
-    # Sample from von Mises-Fisher using single seed (like original)
-    # This ensures identical results to non-batched version
+    k = Y.shape[-2]
+
+    Y_bar = estimate_aligned(x, Cd, k)
+    Y_cent = Y - v[..., na, :]
+    variance = s * sigmasq
+
+    # [(..., t, k, d, na) * (..., t, k, na, d) / (..., t, k, na, na)] -> (..., t, d, d)
+    S = (Y_bar[..., :2, na] * Y_cent[..., na, :2] / variance[..., na, na]).sum(-3)
+    del Y_bar, Y_cent, variance  # free up memory
+
+    kappa_cos = S[..., 0, 0] + S[..., 1, 1]
+    kappa_sin = S[..., 0, 1] - S[..., 1, 0]
+    del S
+
+    mean_direction = jnp.stack([kappa_cos, kappa_sin], axis=-1)
     sampled_direction = sample_vonmises_fisher(seed, mean_direction)
     h = vector_to_angle(sampled_direction)
     return h
 
 
+@jax.jit
 def resample_location(
     seed,
     Y,
@@ -402,8 +265,7 @@ def resample_location(
     Cd,
     sigmasq,
     sigmasq_loc,
-    batch_size=50,
-    parallel_message_passing=False,
+    parallel_message_passing=True,
     **kwargs
 ):
     """
@@ -429,10 +291,6 @@ def resample_location(
         Unscaled noise.
     sigmasq_loc : float
         Assumed variance in centroid displacements.
-    batch_size : int, default=50
-        Number of recordings to process at once when sampling
-        centroid positions. Reduce this value to lower peak
-        memory use.
     parallel_message_passing : bool, default=True,
         Use associative scan for Kalman sampling, which is faster on
         a GPU but has a significantly longer jit time.
@@ -444,12 +302,18 @@ def resample_location(
     v : jax array of shape (N, T, d)
         Centroid positions.
     """
-    N = Y.shape[0]
     k, d = Y.shape[-2:]
+
+    Y_rot = apply_rotation(estimate_aligned(x, Cd, k), h)
+
+    variance = s * sigmasq
+    gammasq = 1 / (1 / variance).sum(-1, keepdims=True)
+
+    mu = jnp.einsum("...tkd, ...tk->...td", Y - Y_rot, gammasq / variance)
 
     # Apply Kalman filter to get smooth headings
     # TODO Parameterize these distributional hyperparameter
-    seeds = jr.split(seed, N)
+    seed = jr.split(seed, mask.shape[0])
     m0 = jnp.zeros(d)
     S0 = jnp.eye(d) * 1e4
     A = jnp.eye(d)[na]
@@ -457,6 +321,8 @@ def resample_location(
     Q = jnp.eye(d)[na] * sigmasq_loc
     C = jnp.eye(d)
     D = jnp.zeros(d)
+    R = jnp.repeat(gammasq, d, axis=-1)
+    zz = jnp.zeros_like(mask[:, 1:], dtype=int)
 
     masked_dynamics_noise = sigmasq_loc * 10
     masked_obs_noise = sigmasq.max() * 10
@@ -466,48 +332,26 @@ def resample_location(
         "bias": jnp.zeros(d),
         "cov": jnp.eye(d) * masked_dynamics_noise,
     }
+
     masked_obs_noise_diag = jnp.ones(d) * masked_obs_noise
 
     in_axes = (0, 0, 0, 0, na, na, na, na, na, na, na, 0, na, na)
-    batched_kalman = jax.jit(
-        jax.vmap(partial(kalman_sample, parallel=parallel_message_passing), in_axes)
+    v = jax.vmap(partial(kalman_sample, parallel=parallel_message_passing), in_axes)(
+        seed,
+        mu,
+        mask,
+        zz,
+        m0,
+        S0,
+        A,
+        B,
+        Q,
+        C,
+        D,
+        R,
+        masked_dynamics_params,
+        masked_obs_noise_diag,
     )
-
-    results = []
-    for i in range(0, N, batch_size):
-        end = min(i + batch_size, N)
-
-        Y_rot = apply_rotation(estimate_aligned(x[i:end], Cd, k), h[i:end])
-        variance = s[i:end] * sigmasq
-        gammasq = 1 / (1 / variance).sum(-1, keepdims=True)
-        mu = jnp.einsum("...tkd, ...tk->...td", Y[i:end] - Y_rot, gammasq / variance)
-
-        R = jnp.repeat(gammasq, d, axis=-1)
-        zz = jnp.zeros_like(mask[i:end, 1:], dtype=int)
-
-        v_batch = batched_kalman(
-            seeds[i:end],
-            mu,
-            mask[i:end],
-            zz,
-            m0,
-            S0,
-            A,
-            B,
-            Q,
-            C,
-            D,
-            R,
-            masked_dynamics_params,
-            masked_obs_noise_diag,
-        )
-        v_batch.block_until_ready()
-        results.append(v_batch)
-
-        del Y_rot, variance, gammasq, mu, R, zz, v_batch
-
-    v = jnp.concatenate(results, axis=0)
-    del results, m0, S0, A, B, Q, C, D, masked_dynamics_params, masked_obs_noise_diag
     return v
 
 
@@ -524,7 +368,6 @@ def resample_model(
     resample_local_noise_scale=True,
     fix_heading=False,
     verbose=False,
-    batch_size=200,
     jitter=1e-3,
     parallel_message_passing=False,
     **kwargs
@@ -557,10 +400,6 @@ def resample_model(
         Whether to resample the local noise scales (``s``)
     fix_heading : bool, default=False
         Whether to exclude ``h`` from resampling.
-    batch_size : int, default=50
-        Number of recordings per batch used by all batched
-        resampling steps (continuous trajectories ``x``, heading
-        ``h``, centroid locations ``v``, and local noise scales ``s``).
     jitter : float, default=1e-3
         Amount to boost the diagonal of the covariance matrix
         during backward-sampling of the continuous states.
@@ -583,21 +422,13 @@ def resample_model(
         model["noise_prior"] = noise_prior
         return model
 
-    print_memory_usage("After ARHMM resample")
-    
     seed = model["seed"]
     params = model["params"].copy()
     states = model["states"].copy()
-    
-    # Clean up the old model dict to free memory
-    del model
-    print_memory_usage("After model dict cleanup")
 
     if (not states_only) and resample_global_noise_scale:
         if verbose:
             print("Resampling sigmasq (global noise scales)")
-        print_memory_usage("Before sigmasq resample")
-        params.pop("sigmasq", None)
         params["sigmasq"] = resample_obs_variance(
             seed,
             **data,
@@ -606,73 +437,40 @@ def resample_model(
             s_0=noise_prior,
             **hypparams["obs_hypparams"]
         )
-        params["sigmasq"].block_until_ready()
-        print_memory_usage("After sigmasq resample")
 
-    # Before the memory-intensive continuous state resampling,
-    # ensure all old states are freed
     if verbose:
         print("Resampling x (continuous latent states)")
-    print_memory_usage("Before x resample")
-    states.pop("x", None)
-    
     states["x"] = resample_continuous_stateseqs(
         seed,
         **data,
         **states,
         **params,
-        batch_size=batch_size,
         jitter=jitter,
         parallel_message_passing=parallel_message_passing
     )
-    states["x"].block_until_ready()
-    print_memory_usage("After x resample")
 
     if not fix_heading:
         if verbose:
             print("Resampling h (heading)")
-        print_memory_usage("Before h resample")
-        states.pop("h", None)
-        states["h"] = resample_heading(seed, **data, **states, **params, batch_size=batch_size)
-        states["h"].block_until_ready()
-        print_memory_usage("After h resample")
+        states["h"] = resample_heading(seed, **data, **states, **params)
 
     if verbose:
         print("Resampling v (location)")
-    print_memory_usage("Before v resample")
-    states.pop("v", None)
     states["v"] = resample_location(
-        seed,
-        **data,
-        **states,
-        **params,
-        **hypparams["cen_hypparams"],
-        batch_size=batch_size,
-        parallel_message_passing=parallel_message_passing,
+        seed, **data, **states, **params, **hypparams["cen_hypparams"]
     )
-    states["v"].block_until_ready()
-    print_memory_usage("After v resample")
 
     if resample_local_noise_scale:
         if verbose:
             print("Resampling s (local noise scales)")
-        print_memory_usage("Before s resample")
-        states.pop("s", None)
         states["s"] = resample_scales(
             seed,
             **data,
             **states,
             **params,
-            batch_size=batch_size,
             s_0=noise_prior,
             **hypparams["obs_hypparams"]
         )
-        states["s"].block_until_ready()
-        print_memory_usage("After s resample")
-
-    # Force garbage collection to free memory
-    gc.collect()
-    print_memory_usage("After gc.collect()")
 
     return {
         "seed": seed,

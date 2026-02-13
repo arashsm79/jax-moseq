@@ -1,9 +1,8 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import gc
 from functools import partial
-from jax_moseq.utils import apply_affine
+from jax_moseq.utils import mixed_map, apply_affine
 from jax_moseq.models import arhmm
 from jax_moseq.utils.kalman import (
     kalman_sample,
@@ -15,7 +14,7 @@ from jax_moseq.utils.kalman import (
 na = jnp.newaxis
 
 
-
+@partial(jax.jit, static_argnames=("parallel_message_passing",))
 def resample_continuous_stateseqs(
     seed,
     y,
@@ -26,8 +25,6 @@ def resample_continuous_stateseqs(
     Q,
     Cd,
     sigmasq,
-    batch_size=50,
-    seeds=None,
     jitter=1e-3,
     parallel_message_passing=True,
     **kwargs
@@ -55,12 +52,6 @@ def resample_continuous_stateseqs(
         Affine transform from `latent_dim` to `state_dim`
     sigmasq : jax.Array of shape (obs_dim,)
         Unscaled noise.
-    batch_size : int, default=50
-        Number of recordings to process at once.
-    seeds : jax.Array of shape (n_recordings, 2), optional
-        Optional pre-split PRNG keys (one key per recording).
-        If provided, these are used directly instead of
-        splitting ``seed`` inside this function.
     jitter : float, default=1e-3
         Amount to boost the diagonal of the covariance matrix
         during backward-sampling of the continuous states.
@@ -84,9 +75,22 @@ def resample_continuous_stateseqs(
     masked_dynamics_noise = 10
     masked_obs_noise = 10
 
+    # =====================================================================
+    # 1. Omit the first L frames of observations and associated sequences
+    # =====================================================================
+    y_ = y[:, n_lags - 1 :]
+    mask_ = mask[:, n_lags - 1 :]
+
+    # Scale unscaled observations by fitted diagonal scales
+    R_ = sigmasq * s[:, n_lags - 1 :]
+
     # ==========================================================================
-    # 1. Reformat L'th-order AR dynamics in R^D to 1st-order dynamics in R^{DL}
+    # 2. Reformat L'th-order AR dynamics in R^D to 1st-order dynamics in R^{DL}
     # ==========================================================================
+    C_, d_, R_, y_, m0_, S0_ = jax.vmap(
+        ar_to_lds_emissions, in_axes=(na, 0, 0, na, na, na)
+    )(Cd, sigmasq * s, y, m0, S0, n_lags)
+
     A_, b_, Q_ = ar_to_lds_dynamics(Ab, Q)
 
     # =============================================
@@ -109,7 +113,7 @@ def resample_continuous_stateseqs(
     masked_obs_noise_diag = jnp.ones(obs_dim) * masked_obs_noise
 
     # ==================================================
-    # 3. Apply vectorized Kalman sample to each recording in batches
+    # 4. Apply vectorized Kalman sample to each recording
     # Shapes of time-varying parameters going into the Kalman sampler are
     #   ys:     (n_timesteps-n_lags+1, obs_dim), corresponding to timesteps  [L-1, T]
     #   mask:   (n_timesteps-n_lags+1,)
@@ -117,41 +121,25 @@ def resample_continuous_stateseqs(
     #   Rs:     (n_timesteps-n_lags+1, obs_dim)
     # ==================================================
     in_axes = (0, 0, 0, 0, na, na, na, na, na, na, na, 0, na, na)
-    if seeds is None:
-        seeds = jr.split(seed, n_recordings)
-
-    vmap_kalman = jax.vmap(
+    x = mixed_map(
         partial(kalman_sample, jitter=jitter, parallel=parallel_message_passing),
         in_axes,
+    )(
+        jr.split(seed, n_recordings),
+        y_,
+        mask_,
+        z,
+        m0,
+        S0,
+        A_,
+        b_,
+        Q_,
+        C_,
+        d_,
+        R_,
+        masked_dynamics_params,
+        masked_obs_noise_diag,
     )
-
-    results = []
-    for i in range(0, n_recordings, batch_size):
-        end = min(i + batch_size, n_recordings)
-
-        C_batch, d_batch, R_batch, y_batch, _, _ = jax.vmap(
-            ar_to_lds_emissions, in_axes=(na, 0, 0, na, na, na)
-        )(Cd, sigmasq * s[i:end], y[i:end], m0, S0, n_lags)
-
-        x_batch = vmap_kalman(
-            seeds[i:end],
-            y_batch,
-            mask[i:end, n_lags - 1 :],
-            z[i:end],
-            m0,
-            S0,
-            A_,
-            b_,
-            Q_,
-            C_batch,
-            d_batch,
-            R_batch,
-            masked_dynamics_params,
-            masked_obs_noise_diag,
-        )
-        results.append(x_batch)
-
-    x = jnp.concatenate(results, axis=0)
 
     # =========================================================================
     # 5. Reformat sampled trajectories back into L'th order AR dynamics in R^D
@@ -201,9 +189,7 @@ def resample_obs_variance(seed, Y, mask, x, s, Cd, nu_sigma, sigmasq_0, **kwargs
         Unscaled noise.
     """
     sqerr = compute_squared_error(Y, x, Cd, mask)
-    result = resample_obs_variance_from_sqerr(seed, sqerr, mask, s, nu_sigma, sigmasq_0)
-    del sqerr
-    return result
+    return resample_obs_variance_from_sqerr(seed, sqerr, mask, s, nu_sigma, sigmasq_0)
 
 
 @jax.jit
@@ -240,9 +226,7 @@ def resample_obs_variance_from_sqerr(
 
     k = sqerr.shape[-1]
     S_y = (sqerr / s).reshape(-1, k).sum(0)  # (..., k) -> k
-    del sqerr
     variance = nu_sigma * sigmasq_0 + S_y
-    del S_y
     return _resample_spread(seed, degs, variance)
 
 
@@ -276,9 +260,7 @@ def resample_scales(seed, Y, x, Cd, sigmasq, nu_s, s_0, **kwargs):
         Noise scales.
     """
     sqerr = compute_squared_error(Y, x, Cd)
-    result = resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
-    del sqerr
-    return result
+    return resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
 
 
 @jax.jit
@@ -361,7 +343,6 @@ def compute_squared_error(Y, x, Cd, mask=None):
     """
     Y_bar = apply_affine(x, Cd)
     sqerr = (Y - Y_bar) ** 2
-    del Y_bar
     if mask is not None:
         sqerr = mask[..., na] * sqerr
     return sqerr
@@ -376,7 +357,6 @@ def resample_model(
     ar_only=False,
     states_only=False,
     skip_noise=True,
-    batch_size=50,
     parallel_message_passing=False,
     **kwargs
 ):
@@ -402,9 +382,6 @@ def resample_model(
         Whether to restrict sampling to states.
     skip_noise : bool, default=True
         Whether to exclude `sigmasq` and `s` from resampling.
-    batch_size : int, default=50
-        Number of recordings per batch when resampling
-        continuous latent trajectories `x`.
     parallel_message_passing : bool, default=True,
         Use associative scan for Kalman sampling, which is faster on
         a GPU but has a significantly longer jit time.
@@ -424,39 +401,24 @@ def resample_model(
     seed = model["seed"]
     params = model["params"].copy()
     states = model["states"].copy()
-    
-    # Clean up the old model dict to free memory
-    del model
 
     if not (states_only or skip_noise):
-        old_sigmasq = params.get("sigmasq")
         params["sigmasq"] = resample_obs_variance(
             seed, **data, **states, **params, **hypparams["obs_hypparams"]
         )
-        del old_sigmasq
 
-    # Before the memory-intensive continuous state resampling,
-    # ensure we've freed all old states that won't be used
-    states.pop("x", None)
-    
     states["x"] = resample_continuous_stateseqs(
         seed,
         **data,
         **states,
         **params,
-        batch_size=batch_size,
         parallel_message_passing=parallel_message_passing
     )
-    states["x"].block_until_ready()
 
     if not skip_noise:
-        states.pop("s", None)
         states["s"] = resample_scales(
             seed, **data, **states, **params, **hypparams["obs_hypparams"]
         )
-
-    # Force garbage collection to free memory
-    gc.collect()
 
     return {
         "seed": seed,
